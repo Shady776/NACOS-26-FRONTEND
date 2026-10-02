@@ -13,14 +13,13 @@ import NotFound from "./pages/NotFound";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import ProtectedRoute from "./components/ProtectedRoute";
-import StudentCourses from "./pages/StudentCourses";
 import StudentAssignments from "./pages/StudentAssignments";
 import StudentWarnings from "./pages/StudentWarnings";
 import StudentProfile from "./pages/StudentProfile";
 import StudentTest from "./pages/StudentTest";
 import StudentEnrollment from "./pages/StudentEnrollment";
+import StudentMaterials from "./pages/StudentMaterials";
 import TeacherCourses from "./pages/TeacherCourses";
-import TeacherMaterials from "./pages/TeacherMaterials";
 import TeacherGrading from "./pages/TeacherGrading";
 import TeacherAssignments from "./pages/TeacherAssignments";
 import TeacherEnrollments from "./pages/TeacherEnrollment";
@@ -53,8 +52,8 @@ const App = () => (
                 <ProtectedRoute allowedRoles={["student"]}>
                   <Routes>
                     <Route path="/" element={<StudentDashboard />} />
-                    <Route path="/courses" element={<StudentCourses />} />
                     <Route path="/assignments" element={<StudentAssignments />} />
+                    <Route path="/materials" element={<StudentMaterials />} />
 
                     <Route path="/profile" element={<StudentProfile />} />
                     <Route path="/test" element={<StudentTest />} />
@@ -72,7 +71,6 @@ const App = () => (
                   <Routes>
                     <Route path="/" element={<TeacherDashboard />} />
                     <Route path="/courses" element={<TeacherCourses />} />
-                    <Route path="/materials" element={<TeacherMaterials />} />
                     <Route path="/enrollments" element={<TeacherEnrollments />} />
                     <Route path="/grading" element={<TeacherGrading />} />
                     <Route path="/assignments" element={<TeacherAssignments />} />

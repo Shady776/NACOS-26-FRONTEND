@@ -19,7 +19,8 @@ import {
   GraduationCap,
   ClipboardCheck,
   FileQuestion,
-  ShieldAlert
+  ShieldAlert,
+  FolderOpen
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -48,6 +49,7 @@ const studentNav: NavItem[] = [
   { icon: Home,          label: "Dashboard",   href: "/student" },
   { icon: BookOpen,      label: "All Courses",  href: "/student/enrollment" },
   { icon: FileText,      label: "Assignments",  href: "/student/assignments" },
+  { icon: FolderOpen,    label: "Materials",    href: "/student/materials" },
   { icon: ClipboardCheck,label: "Take Test",    href: "/student/test" },
   // { icon: ShieldAlert,   label: "Warnings",     href: "/student/warnings" },
   // { icon: User,          label: "Profile",      href: "/student/profile" },

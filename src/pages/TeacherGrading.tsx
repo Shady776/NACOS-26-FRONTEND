@@ -5,7 +5,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { CheckCircle2, Clock, Sparkles, User, FileText, Calendar, Award, Loader2, BookOpen, Eye } from "lucide-react";
+import { CheckCircle2, Clock, Sparkles, User, FileText, Calendar, Award, Loader2, BookOpen, Eye, Download, AlertCircle, X } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -13,6 +14,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { toast } from "sonner";
 import { BASE_URL } from "@/components/api/api";
 import { toSafeHtml } from "@/lib/sanitize";
+import { usePolling } from "@/lib/usePolling";
 
 const API_BASE = BASE_URL;
 
@@ -26,11 +28,18 @@ const TeacherGrading = () => {
     const [gradingSubmission, setGradingSubmission] = useState(null);
     const [manualGrade, setManualGrade] = useState({ score: "", feedback: "" });
     const [aiCriteria, setAiCriteria] = useState("");
-    const [batchGrading, setBatchGrading] = useState(false);
     const [viewingSubmission, setViewingSubmission] = useState(null);
     const [showAIDialog, setShowAIDialog] = useState(false);
     const [showManualDialog, setShowManualDialog] = useState(false);
     const [showViewDialog, setShowViewDialog] = useState(false);
+    // AI grading: aiTarget is null for a batch run, or the one submission being graded.
+    const [aiTarget, setAiTarget] = useState(null);
+    const [aiScope, setAiScope] = useState("all");
+    const [aiBusy, setAiBusy] = useState(false);
+    const [job, setJob] = useState(null);
+    const [showJobErrors, setShowJobErrors] = useState(false);
+    const [filter, setFilter] = useState("all");
+    const [downloadingId, setDownloadingId] = useState(null);
 
     const token = localStorage.getItem("access_token");
 
@@ -45,10 +54,28 @@ const TeacherGrading = () => {
     }, [selectedCourse]);
 
     useEffect(() => {
+        setJob(null);
+        setShowJobErrors(false);
         if (selectedAssignment) {
             fetchSubmissions();
+            // Resume the progress display only if a run is still going; old finished runs stay hidden.
+            fetchJob().then(latest => { if (latest && latest.status !== "running") setJob(null); });
+            const saved = assignments.find(a => a.id === selectedAssignment);
+            setAiCriteria(saved?.grading_criteria || "");
         }
     }, [selectedAssignment]);
+
+    // While a batch run is going, check on it every 2 seconds (paused in hidden tabs).
+    usePolling(async () => {
+        const latest = await fetchJob();
+        if (!latest) return;
+        fetchSubmissions(true);
+        if (latest.status === "done") {
+            toast.success(`AI grading finished: ${latest.graded} graded${latest.failed ? `, ${latest.failed} need your attention` : ""}`);
+        } else if (latest.status === "error") {
+            toast.error(latest.message || "AI grading stopped unexpectedly");
+        }
+    }, 2000, job?.status === "running");
 
     const fetchCourses = async () => {
         try {
@@ -80,8 +107,24 @@ const TeacherGrading = () => {
         }
     };
 
-    const fetchSubmissions = async () => {
-        setLoading(true);
+    const fetchJob = async () => {
+        try {
+            const res = await fetch(`${API_BASE}/assignments/${selectedAssignment}/grade/ai-batch/status`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            if (res.ok) {
+                const data = await res.json();
+                setJob(data.status === "idle" ? null : data);
+                return data;
+            }
+        } catch (err) {
+            /* a missed poll is harmless: the next one catches up */
+        }
+        return null;
+    };
+
+    const fetchSubmissions = async (silent = false) => {
+        if (!silent) setLoading(true);
         try {
             const res = await fetch(`${API_BASE}/submissions/assignment/${selectedAssignment}`, {
                 headers: { Authorization: `Bearer ${token}` }
@@ -93,7 +136,7 @@ const TeacherGrading = () => {
         } catch (err) {
             toast.error("Failed to load submissions");
         } finally {
-            setLoading(false);
+            if (!silent) setLoading(false);
         }
     };
 
@@ -131,39 +174,86 @@ const TeacherGrading = () => {
         }
     };
 
-    const handleAIBatchGrade = async () => {
+    const openAIDialog = (submission = null) => {
+        setAiTarget(submission);
+        setShowAIDialog(true);
+    };
+
+    const handleAIGrade = async () => {
         if (!aiCriteria.trim()) {
             toast.error("Please provide grading criteria for AI");
             return;
         }
 
-        setBatchGrading(true);
+        setAiBusy(true);
         try {
-            const res = await fetch(`${API_BASE}/assignments/${selectedAssignment}/grade/ai-batch`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}`
-                },
-                body: JSON.stringify({ criteria: aiCriteria })
-            });
+            const single = !!aiTarget;
+            const res = await fetch(
+                single
+                    ? `${API_BASE}/submissions/${aiTarget.id}/grade/ai`
+                    : `${API_BASE}/assignments/${selectedAssignment}/grade/ai-batch`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`
+                    },
+                    body: JSON.stringify(single ? { criteria: aiCriteria } : { criteria: aiCriteria, scope: aiScope })
+                }
+            );
 
-            if (res.ok) {
-                const result = await res.json();
-                toast.success(
-                    `Batch grading completed! ${result.graded_successfully} submissions graded successfully${result.failed > 0 ? `, ${result.failed} failed` : ""}`
-                );
-                setShowAIDialog(false);
-                setAiCriteria("");
-                fetchSubmissions();
-            } else {
-                const err = await res.json();
-                toast.error(err.detail || "AI batch grading failed");
+            const data = await res.json().catch(() => null);
+            if (!res.ok) {
+                toast.error(data?.detail || "AI grading failed");
+                return;
             }
+
+            setShowAIDialog(false);
+            if (single) {
+                toast.success(`Graded: ${data.score} / ${selectedAssignmentData?.max_score}`);
+            } else {
+                setJob(data);
+                setShowJobErrors(false);
+                toast.success(`AI grading started for ${data.total} submission${data.total === 1 ? "" : "s"}`);
+            }
+            fetchSubmissions(true);
+            // keep the saved criteria in the list so reopening the dialog shows them
+            setAssignments(prev => prev.map(a => a.id === selectedAssignment ? { ...a, grading_criteria: aiCriteria.trim() } : a));
         } catch (err) {
-            toast.error("AI batch grading failed");
+            toast.error("AI grading failed");
         } finally {
-            setBatchGrading(false);
+            setAiBusy(false);
+        }
+    };
+
+    const getFileExtension = (url) => {
+        const match = /\.([a-z0-9]{1,8})(?:\?|$)/i.exec(url || "");
+        return match ? match[1].toLowerCase() : "";
+    };
+
+    const handleDownloadFile = async (submission) => {
+        setDownloadingId(submission.id);
+        try {
+            const res = await fetch(`${API_BASE}/submissions/${submission.id}/file`);
+            if (!res.ok) {
+                const err = await res.json().catch(() => null);
+                throw new Error(err?.detail || "Could not download the file");
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            const who = submission.student?.matric_number || submission.student?.username || "student";
+            const ext = getFileExtension(submission.file_url);
+            link.href = url;
+            link.download = `${who}_${selectedAssignmentData?.title || "submission"}${ext ? `.${ext}` : ""}`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            toast.error(err.message);
+        } finally {
+            setDownloadingId(null);
         }
     };
 
@@ -196,8 +286,19 @@ const TeacherGrading = () => {
         return <Badge variant={statusInfo.variant}>{statusInfo.label}</Badge>;
     };
 
-    const pendingSubmissions = submissions.filter(s => s.status !== "GRADED");
-    const gradedSubmissions = submissions.filter(s => s.status === "GRADED");
+    // "files" = has an attached file (typed text may come with it); "text" = typed answer only.
+    const kindOf = (s) => (s.file_url ? "files" : "text");
+    const matchesFilter = (s) => filter === "all" || kindOf(s) === filter;
+    const pendingSubmissions = submissions.filter(s => s.status !== "GRADED" && matchesFilter(s));
+    const gradedSubmissions = submissions.filter(s => s.status === "GRADED" && matchesFilter(s));
+    const gradableCount = (scope) =>
+        submissions.filter(s => s.status !== "GRADED" && (s.content || s.file_url) && (scope === "all" || kindOf(s) === scope)).length;
+    const kindCounts = {
+        all: submissions.length,
+        text: submissions.filter(s => kindOf(s) === "text").length,
+        files: submissions.filter(s => kindOf(s) === "files").length,
+    };
+    const jobRunning = job?.status === "running";
     const selectedCourseData = courses.find(c => c.id === selectedCourse);
     const selectedAssignmentData = assignments.find(a => a.id === selectedAssignment);
 
@@ -259,61 +360,14 @@ const TeacherGrading = () => {
 
                         {selectedAssignment && (
                             <div className="flex flex-wrap gap-3 pt-4 border-t">
-                                <Dialog open={showAIDialog} onOpenChange={setShowAIDialog}>
-                                    <DialogTrigger asChild>
-                                        <Button className="gap-2" disabled={pendingSubmissions.length === 0}>
-                                            <Sparkles className="w-4 h-4" />
-                                            AI Batch Grade ({pendingSubmissions.filter(s => s.content).length} text submissions)
-                                        </Button>
-                                    </DialogTrigger>
-                                    <DialogContent className="max-w-2xl">
-                                        <DialogHeader>
-                                            <DialogTitle>AI Batch Grading</DialogTitle>
-                                            <DialogDescription>
-                                                Provide grading criteria for the AI to evaluate all ungraded text submissions
-                                            </DialogDescription>
-                                        </DialogHeader>
-                                        <div className="space-y-4 py-4">
-                                            <div className="space-y-2">
-                                                <label className="text-sm font-medium">Grading Criteria</label>
-                                                <Textarea
-                                                    placeholder="e.g., Focus on code quality, proper error handling, clear documentation, and efficient algorithms. Bonus points for creative solutions."
-                                                    value={aiCriteria}
-                                                    onChange={(e) => setAiCriteria(e.target.value)}
-                                                    rows={6}
-                                                    className="resize-none"
-                                                />
-                                                <p className="text-xs text-muted-foreground">
-                                                    The AI will use these criteria along with the assignment description to grade submissions
-                                                </p>
-                                            </div>
-                                            <div className="bg-muted p-4 rounded-lg">
-                                                <p className="text-sm text-foreground">
-                                                    <strong>Note:</strong> AI grading only works for text submissions.
-                                                    File-only submissions will be skipped.
-                                                </p>
-                                            </div>
-                                        </div>
-                                        <DialogFooter>
-                                            <Button variant="outline" onClick={() => setShowAIDialog(false)} disabled={batchGrading}>
-                                                Cancel
-                                            </Button>
-                                            <Button onClick={handleAIBatchGrade} disabled={batchGrading || !aiCriteria.trim()}>
-                                                {batchGrading ? (
-                                                    <>
-                                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                                        Grading...
-                                                    </>
-                                                ) : (
-                                                    <>
-                                                        <Sparkles className="w-4 h-4 mr-2" />
-                                                        Start AI Grading
-                                                    </>
-                                                )}
-                                            </Button>
-                                        </DialogFooter>
-                                    </DialogContent>
-                                </Dialog>
+                                <Button
+                                    className="gap-2"
+                                    onClick={() => openAIDialog(null)}
+                                    disabled={gradableCount("all") === 0 || jobRunning}
+                                >
+                                    {jobRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                                    AI Grade Ungraded ({gradableCount("all")})
+                                </Button>
 
                                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                                     <FileText className="w-4 h-4" />
@@ -321,10 +375,70 @@ const TeacherGrading = () => {
                                 </div>
                             </div>
                         )}
+
+                        {selectedAssignment && job && (
+                            <div className="rounded-lg border p-4 space-y-3">
+                                <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium flex items-center gap-2">
+                                        {jobRunning ? (
+                                            <><Loader2 className="w-4 h-4 animate-spin" /> AI is grading: {job.processed} of {job.total} done</>
+                                        ) : job.status === "error" ? (
+                                            <><AlertCircle className="w-4 h-4 text-destructive" /> {job.message || "AI grading stopped unexpectedly"}</>
+                                        ) : (
+                                            <><CheckCircle2 className="w-4 h-4 text-green-600" /> AI grading finished: {job.graded} graded{job.skipped ? `, ${job.skipped} already graded` : ""}{job.failed ? `, ${job.failed} failed` : ""}</>
+                                        )}
+                                    </p>
+                                    {!jobRunning && (
+                                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setJob(null)} aria-label="Dismiss">
+                                            <X className="w-4 h-4" />
+                                        </Button>
+                                    )}
+                                </div>
+                                <Progress value={job.total ? (job.processed / job.total) * 100 : 0} className="h-2" />
+                                {!jobRunning && job.failed > 0 && (
+                                    <div className="space-y-2">
+                                        <Button variant="link" className="h-auto p-0 text-sm" onClick={() => setShowJobErrors(v => !v)}>
+                                            {showJobErrors ? "Hide" : "Show"} the {job.failed} that need your attention
+                                        </Button>
+                                        {showJobErrors && (
+                                            <ul className="text-sm space-y-1">
+                                                {job.errors.map((e) => (
+                                                    <li key={e.submission_id} className="text-muted-foreground">
+                                                        <span className="font-medium text-foreground">{e.student}:</span> {e.reason}
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        )}
+                                        <p className="text-xs text-muted-foreground">These stay in Pending Review so you can grade them by hand or try again.</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
                     </CardContent>
                 </Card>
 
                 {/* Submissions Tabs */}
+                {selectedAssignment && (
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm text-muted-foreground mr-1">Show:</span>
+                        {[
+                            { key: "all", label: "All" },
+                            { key: "text", label: "Text" },
+                            { key: "files", label: "Files" },
+                        ].map(chip => (
+                            <Button
+                                key={chip.key}
+                                size="sm"
+                                variant={filter === chip.key ? "default" : "outline"}
+                                className="rounded-full h-8"
+                                onClick={() => setFilter(chip.key)}
+                            >
+                                {chip.label} ({kindCounts[chip.key]})
+                            </Button>
+                        ))}
+                    </div>
+                )}
+
                 {selectedAssignment && (
                     <Tabs defaultValue="pending" className="space-y-6">
                         <TabsList>
@@ -408,6 +522,15 @@ const TeacherGrading = () => {
                                                         >
                                                             <Eye className="w-4 h-4 mr-2" />
                                                             View
+                                                        </Button>
+                                                        <Button
+                                                            variant="outline"
+                                                            size="sm"
+                                                            disabled={jobRunning || (!submission.content && !submission.file_url)}
+                                                            onClick={() => openAIDialog(submission)}
+                                                        >
+                                                            <Sparkles className="w-4 h-4 mr-2" />
+                                                            AI Grade
                                                         </Button>
                                                         <Button
                                                             size="sm"
@@ -510,6 +633,77 @@ const TeacherGrading = () => {
                 )}
             </div>
 
+            {/* AI Grading Dialog (one submission, or every ungraded one) */}
+            <Dialog open={showAIDialog} onOpenChange={(open) => { if (!aiBusy) setShowAIDialog(open); }}>
+                <DialogContent className="max-w-2xl">
+                    <DialogHeader>
+                        <DialogTitle>
+                            {aiTarget ? "AI Grade Submission" : "AI Grade Ungraded Submissions"}
+                        </DialogTitle>
+                        <DialogDescription>
+                            {aiTarget
+                                ? `The AI will grade ${aiTarget.student?.full_name || aiTarget.student?.username}'s work and the student will be notified.`
+                                : "The AI grades the ungraded submissions you pick below, in the background. You can leave this page open and watch the progress."}
+                        </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4 py-4">
+                        {!aiTarget && (
+                            <div className="space-y-2">
+                                <label className="text-sm font-medium">Which submissions</label>
+                                <Select value={aiScope} onValueChange={setAiScope}>
+                                    <SelectTrigger>
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="all">All ungraded ({gradableCount("all")})</SelectItem>
+                                        <SelectItem value="text">Typed answers only ({gradableCount("text")})</SelectItem>
+                                        <SelectItem value="files">With an attached file ({gradableCount("files")})</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                            </div>
+                        )}
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium">Grading Criteria</label>
+                            <Textarea
+                                placeholder="e.g., Focus on code quality, proper error handling, clear documentation, and efficient algorithms."
+                                value={aiCriteria}
+                                onChange={(e) => setAiCriteria(e.target.value)}
+                                rows={6}
+                                className="resize-none"
+                            />
+                            <p className="text-xs text-muted-foreground">
+                                Used together with the assignment description. Saved for this assignment, so you only type it once.
+                            </p>
+                        </div>
+                        <div className="bg-muted p-4 rounded-lg">
+                            <p className="text-sm text-foreground">
+                                <strong>What the AI can read:</strong> typed answers, code files, PDFs, Word documents and ZIP projects.
+                                Photos and scanned pages are read with a vision model when the server has one set up.
+                                Anything it can't read is listed afterwards so you can grade it by hand.
+                            </p>
+                        </div>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowAIDialog(false)} disabled={aiBusy}>
+                            Cancel
+                        </Button>
+                        <Button onClick={handleAIGrade} disabled={aiBusy || !aiCriteria.trim()}>
+                            {aiBusy ? (
+                                <>
+                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                    {aiTarget ? "Grading..." : "Starting..."}
+                                </>
+                            ) : (
+                                <>
+                                    <Sparkles className="w-4 h-4 mr-2" />
+                                    {aiTarget ? "Grade with AI" : "Start AI Grading"}
+                                </>
+                            )}
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
             {/* Manual Grading Dialog */}
             <Dialog open={showManualDialog} onOpenChange={setShowManualDialog}>
                 <DialogContent className="max-w-2xl">
@@ -600,15 +794,18 @@ const TeacherGrading = () => {
                         {viewingSubmission?.file_url && (
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">File Submission</label>
-                                <a
-                                    href={viewingSubmission.file_url}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="flex items-center gap-2 text-blue-600 hover:underline"
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="gap-2"
+                                    disabled={downloadingId === viewingSubmission.id}
+                                    onClick={() => handleDownloadFile(viewingSubmission)}
                                 >
-                                    <FileText className="w-4 h-4" />
-                                    View Submitted File
-                                </a>
+                                    {downloadingId === viewingSubmission.id
+                                        ? <Loader2 className="w-4 h-4 animate-spin" />
+                                        : <Download className="w-4 h-4" />}
+                                    Download submitted file
+                                </Button>
                             </div>
                         )}
 
